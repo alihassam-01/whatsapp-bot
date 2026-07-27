@@ -160,52 +160,80 @@ export function createApp(options = {}) {
       headers.Authorization = `Bearer ${config.gatewayCredential}`;
     }
 
-    let response;
-    try {
-      response = await fetchImpl(`${config.gatewayUrl}/tools/invoke`, {
-        method: "POST",
-        headers,
-        signal: AbortSignal.timeout(config.timeoutMs),
-        body: JSON.stringify({
-          tool: config.messageTool,
-          sessionKey: config.sessionKey,
-          args: {
-            action: "send",
-            channel: config.channel,
-            target,
-            message: message.trim(),
-            ...(accountId ? { accountId: accountId.trim() } : {}),
-          },
-        }),
-      });
-    } catch (cause) {
-      const error = new Error(
-        cause?.name === "TimeoutError"
-          ? "OpenClaw gateway request timed out"
-          : "OpenClaw gateway is unavailable",
-      );
-      error.statusCode = cause?.name === "TimeoutError" ? 504 : 502;
-      throw error;
-    }
+    const attempts = [
+      {
+        tool: config.messageTool,
+        args: {
+          action: "send",
+          channel: config.channel,
+          target,
+          message: message.trim(),
+          ...(accountId ? { accountId: accountId.trim() } : {}),
+        },
+      },
+      {
+        tool: config.messageTool === "message" ? "message.send" : config.messageTool,
+        args: {
+          channel: config.channel,
+          target,
+          message: message.trim(),
+          ...(accountId ? { account: accountId.trim() } : {}),
+        },
+      },
+    ];
 
-    const rawText = await response.text();
-    let payload;
-    try {
-      payload = rawText ? JSON.parse(rawText) : {};
-    } catch {
-      payload = { raw: rawText };
-    }
+    let lastError;
+    for (const attempt of attempts) {
+      let response;
+      try {
+        response = await fetchImpl(`${config.gatewayUrl}/tools/invoke`, {
+          method: "POST",
+          headers,
+          signal: AbortSignal.timeout(config.timeoutMs),
+          body: JSON.stringify({
+            tool: attempt.tool,
+            sessionKey: config.sessionKey,
+            args: attempt.args,
+          }),
+        });
+      } catch (cause) {
+        const error = new Error(
+          cause?.name === "TimeoutError"
+            ? "OpenClaw gateway request timed out"
+            : "OpenClaw gateway is unavailable",
+        );
+        error.statusCode = cause?.name === "TimeoutError" ? 504 : 502;
+        throw error;
+      }
 
-    if (!response.ok) {
+      const rawText = await response.text();
+      let payload;
+      try {
+        payload = rawText ? JSON.parse(rawText) : {};
+      } catch {
+        payload = { raw: rawText };
+      }
+
+      if (response.ok) {
+        return payload;
+      }
+
       const messageText =
         payload?.error?.message ?? payload?.message ?? `OpenClaw gateway returned ${response.status}`;
       const error = new Error(messageText);
       error.statusCode = response.status;
       error.details = payload;
-      throw error;
+      lastError = error;
+
+      const shouldRetryWithFallback = attempt.tool === "message"
+        && attempts.length > 1
+        && /tool not available: message/i.test(messageText);
+      if (!shouldRetryWithFallback) {
+        throw error;
+      }
     }
 
-    return payload;
+    throw lastError ?? new Error("OpenClaw message send failed");
   }
 
   return http.createServer(async (req, res) => {
@@ -306,7 +334,7 @@ export function startServer(env = process.env) {
   const server = createApp({
     port: Number.parseInt(env.PORT ?? String(DEFAULTS.port), 10),
     gatewayUrl: env.OPENCLAW_GATEWAY_URL ?? DEFAULTS.gatewayUrl,
-    gatewayCredential: env.OPENCLAW_GATEWAY_TOKEN ?? env.OPENCLAW_GATEWAY_PASSWORD,
+    gatewayCredential: env.OPENCLAW_GATEWAY_TOKEN ?? env.OPENCLAW_GATEWAY_PASSWORD ?? "dev-secret-token",
     sessionKey: env.OPENCLAW_SESSION_KEY ?? DEFAULTS.sessionKey,
     messageTool: env.OPENCLAW_MESSAGE_TOOL ?? DEFAULTS.messageTool,
     channel: env.OPENCLAW_CHANNEL ?? DEFAULTS.channel,
@@ -322,6 +350,123 @@ export function startServer(env = process.env) {
   server.listen(port, "127.0.0.1", () => {
     console.log(`Listening on http://127.0.0.1:${port}`);
   });
+
+  // Mock OpenAI server to intercept inbound messages from OpenClaw
+  const mockServer = http.createServer(async (req, res) => {
+    console.log(`[Mock OpenAI] Received request: ${req.method} ${req.url}`);
+    if (req.method === "POST") {
+      try {
+        const body = await readJsonBody(req);
+        let sender = "+10000000000";
+        let messageId = null;
+
+        // Extract user text properly from OpenClaw input array or messages array
+        let messagesArray = [];
+        if (Array.isArray(body.input)) {
+          messagesArray = body.input;
+        } else if (Array.isArray(body.messages)) {
+          messagesArray = body.messages;
+        }
+        
+        await writeFile('payload.json', JSON.stringify(messagesArray, null, 2));
+
+        let rawText = "";
+        const userMessages = messagesArray.filter((m) => m.role === "user");
+        for (const m of userMessages) {
+          let t = "";
+          if (Array.isArray(m.content)) {
+            t = m.content.map((c) => c.text || "").join("\n");
+          } else if (typeof m.content === "string") {
+            t = m.content;
+          }
+          
+          if (t && t.includes("BEGIN_OPENCLAW_INTERNAL_CONTEXT")) {
+            // Extract sender and message_id from the internal context block
+            const senderMatch = t.match(/"e164"\s*:\s*"(\+\d+)"/);
+            if (senderMatch) {
+              sender = senderMatch[1];
+            }
+            const msgIdMatch = t.match(/"message_id"\s*:\s*"([^"]+)"/);
+            if (msgIdMatch) {
+              messageId = msgIdMatch[1];
+            }
+          } else if (t) {
+            // This is the actual user message
+            rawText = t;
+          }
+        }
+        
+        if (!rawText) {
+          rawText = JSON.stringify(body);
+        }
+
+        console.log("[Mock OpenAI] Extracted raw text:", rawText);
+
+        let text = rawText;
+
+        // Clean up any remaining OpenClaw context prefixes if they exist
+        text = text.replace(/\[.*?\]/g, "").trim();
+
+        let dedupeKey = messageId || rawText;
+
+        // Deduplicate based on dedupeKey to prevent double processing if OpenClaw retries
+        if (dedupeKey && global.seenMessages && global.seenMessages.has(dedupeKey)) {
+          console.log("[Mock OpenAI] Ignoring duplicate request");
+        } else {
+          if (dedupeKey) {
+            global.seenMessages = global.seenMessages || new Set();
+            global.seenMessages.add(dedupeKey);
+            
+            // Auto-expire from seen set after 10 seconds to allow the user to send identical messages later
+            setTimeout(() => {
+              global.seenMessages.delete(dedupeKey);
+            }, 10000);
+          }
+
+          try {
+            // Use native fetch
+          await fetch("http://127.0.0.1:3008/api/whatsapp-inbound/message", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              event: "message_received",
+              data: {
+                channel: "whatsapp",
+                number: sender,
+                text: text
+              }
+            })
+          });
+          } catch (e) {
+            console.error("[Mock OpenAI] Failed to forward to webhook:", e.message);
+          }
+        } // end of else block for deduplication
+        
+        // Return a generic success response that satisfies both chat/completions and /responses
+        sendJson(res, 200, {
+          id: "mock-123",
+          object: req.url.includes("responses") ? "response" : "chat.completion",
+          created: Date.now(),
+          model: body.model || "gpt-5.5",
+          choices: [{
+            index: 0,
+            message: { role: "assistant", content: "" },
+            finish_reason: "stop"
+          }]
+        });
+      } catch (e) {
+        console.error(e);
+        sendJson(res, 500, { error: e.message });
+      }
+    } else {
+      sendJson(res, 404, { error: "Not found" });
+    }
+  });
+  
+  mockServer.listen(3009, "127.0.0.1", () => {
+    console.log("Mock OpenAI Server listening on http://127.0.0.1:3009");
+  });
+
   return server;
 }
 
